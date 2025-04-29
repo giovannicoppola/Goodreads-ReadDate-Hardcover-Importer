@@ -3,3 +3,6 @@
 __pycache__
 troubleshooting
 venv
+hardcover_api_key.json
+log.txt
+cookies.json
