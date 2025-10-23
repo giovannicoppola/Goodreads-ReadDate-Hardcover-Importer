@@ -191,6 +191,23 @@ def main():
 
     if download_and_process_goodreads_data(args["<user_id>"], args["--output"]):
         print(f"Data successfully written to {args['--output']}")
+        
+        # Check if the Date Read column has any data
+        try:
+            with open(args["--output"], "r", encoding="utf-8") as tsvfile:
+                reader = csv.DictReader(tsvfile, delimiter="\t")
+                has_any_date_read = any(row.get("Date Read", "").strip() for row in reader)
+                
+                if not has_any_date_read:
+                    print("\n⚠️  WARNING: The 'Date Read' column appears to be empty for all books.")
+                    print("Please ensure the 'Date Read' column is visible in your Goodreads library view.")
+                    print("To do this:")
+                    print("  1. Go to your Goodreads library")
+                    print("  2. Click 'edit' at the top of the columns")
+                    print("  3. Make sure 'Date Read' is checked/visible")
+                    print("  4. Re-run this script after making the column visible")
+        except Exception as e:
+            print(f"Warning: Could not verify Date Read column: {e}")
     else:
         print("Failed to process Goodreads data.")
 
