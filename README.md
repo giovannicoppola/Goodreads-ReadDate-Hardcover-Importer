@@ -16,6 +16,7 @@ This script downloads your Goodreads book data and exports it to a TSV (tab-sepa
 - Exports data in TSV format
 - Includes book titles, authors, dates, ratings, and page counts
 - Optional cookie support for accessing private profiles
+- Automatically checks if the Date Read column is empty and provides helpful guidance
 
 #### Usage
 
@@ -210,6 +211,15 @@ If you encounter a 403 Forbidden error:
 1. Make sure your user ID is correct
 2. If your profile is private, try using cookies
 3. Check if Goodreads is blocking automated access (you might need to wait a while)
+
+If the Date Read column is empty in your exported data:
+
+1. Go to your Goodreads library (https://www.goodreads.com/review/list/)
+2. Click the "edit" button at the top of the columns
+3. Make sure the "Date Read" column is checked/visible
+4. Re-run the script to re-export your data
+
+> **Note**: The script will automatically detect if the Date Read column is empty and display a warning with these instructions.
 
 ### Hardcover Sync
 
