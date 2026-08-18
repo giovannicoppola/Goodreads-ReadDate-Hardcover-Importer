@@ -1,13 +1,15 @@
 """Parse Goodreads data and export to TSV.
 
 Usage:
-  parse_goodreads.py <user_id> [--output=<file>] [--help]
+  parse_goodreads.py <user_id> [--output=<file>] [--cookies=<file>] [--delay=<seconds>] [--help]
   parse_goodreads.py (-h | --help)
 
 Options:
   <user_id>           Goodreads user ID (e.g., 38810427-giovanni)
   --output=<file>     Output TSV file name [default: books.tsv]
-  -h --help          Show this help message and exit
+  --cookies=<file>    JSON file with exported Goodreads cookies [default: cookies.json]
+  --delay=<seconds>   Seconds to wait between page requests [default: 1]
+  -h --help           Show this help message and exit
 
 Examples:
   parse_goodreads.py 38810427-giovanni
@@ -17,6 +19,7 @@ Examples:
 import csv
 import json
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -24,193 +27,284 @@ import requests
 from bs4 import BeautifulSoup
 from docopt import docopt
 
+FIELDNAMES = [
+    "Goodreads ID",
+    "Book Title",
+    "Date Started",
+    "Date Read",
+    "Author",
+    "Average Rating",
+    "Number of Pages",
+]
+
+# Goodreads renders unset dates as this literal string.
+_UNSET_DATE_MARKERS = {"not set", "unknown", "-"}
+
+# Date layouts Goodreads uses in the library table.
+_INPUT_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%b %Y", "%B %Y")
+
 
 def get_text_or_default(element, default=""):
     """Extract text safely from an element."""
     return element.text.strip() if element else default
 
 
+def cell_text(row, field, span_class=None, tag=None):
+    """Return the text of a `td.field <field>` cell, or "" if it is absent.
+
+    Goodreads only renders the columns the user has made visible, so any cell
+    may legitimately be missing from the markup. Returning "" keeps a single
+    hidden column from aborting the whole export.
+    """
+    cell = row.find("td", class_=f"field {field}")
+    if cell is None:
+        return ""
+    if span_class is not None:
+        return get_text_or_default(cell.find("span", class_=span_class))
+    if tag is not None:
+        return get_text_or_default(cell.find(tag))
+    return get_text_or_default(cell)
+
+
 def convert_date(date_str):
-    """Convert date to standard format."""
+    """Convert a Goodreads date to ISO (yyyy-mm-dd) format.
+
+    Month-only dates ("Mar 2020") are anchored to the first of the month.
+    Placeholders such as "not set" become "" so downstream code can treat
+    them as missing rather than as an unparseable date.
+    """
+    date_str = (date_str or "").strip()
+    if not date_str or date_str.lower() in _UNSET_DATE_MARKERS:
+        return ""
+
+    for fmt in _INPUT_DATE_FORMATS:
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return date_str
+
+
+def load_cookies(cookies_file):
+    """Load exported browser cookies, keeping only the Goodreads ones."""
+    if not os.path.exists(cookies_file):
+        return None
+
     try:
-        return datetime.strptime(date_str, "%b %d, %Y").strftime("%Y-%m-%d")
-    except ValueError:
-        return date_str
+        with open(cookies_file, "r", encoding="utf-8") as f:
+            raw_cookies = json.load(f)
+    except json.JSONDecodeError:
+        print(
+            f"Warning: {cookies_file} exists but is not valid JSON. "
+            "Proceeding without cookies."
+        )
+        return None
+    except OSError as e:
+        print(f"Warning: could not read {cookies_file} ({e}). Proceeding without cookies.")
+        return None
+
+    if not isinstance(raw_cookies, list):
+        print(
+            f"Warning: {cookies_file} should contain a JSON list of cookies. "
+            "Proceeding without cookies."
+        )
+        return None
+
+    cookie_dict = {}
+    for cookie in raw_cookies:
+        if not isinstance(cookie, dict) or "name" not in cookie or "value" not in cookie:
+            continue
+        domain = cookie.get("domain", "").lstrip(".").lower()
+        # Only ever send Goodreads cookies to Goodreads. Cookie exports often
+        # contain every cookie in the browser profile.
+        if domain == "goodreads.com" or domain.endswith(".goodreads.com"):
+            cookie_dict[cookie["name"]] = cookie["value"]
+
+    if not cookie_dict:
+        print(f"Warning: no goodreads.com cookies found in {cookies_file}.")
+        return None
+
+    print(f"Loaded {len(cookie_dict)} Goodreads cookies from {cookies_file}.")
+    return cookie_dict
 
 
-def fetch_html(url, cookies=None):
-    """Fetch HTML content from a URL with optional cookies."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.goodreads.com/',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-User': '?1'
-    }
-    
+def make_session(cookies=None):
+    """Build a requests session with browser-like headers and optional cookies."""
     session = requests.Session()
-    
-    # Convert cookies to the format requests expects
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.goodreads.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+        }
+    )
     if cookies:
-        cookie_dict = {}
-        for cookie in cookies:
-            if not cookie.get('hostOnly', False) or (cookie.get('domain', '').startswith('.goodreads.com') or cookie.get('domain', '') == 'www.goodreads.com'):
-                cookie_dict[cookie['name']] = cookie['value']
-        session.cookies.update(cookie_dict)
-    
-    try:
-        response = session.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.RequestException as e:
-        raise
+        session.cookies.update(cookies)
+    return session
+
+
+def fetch_html(session, url):
+    """Fetch HTML content from a URL, raising on HTTP errors."""
+    response = session.get(url, timeout=30)
+    response.raise_for_status()
+    return response.text
 
 
 def process_review_row(row):
     """Process a single review row and return a dictionary of the data."""
-    book_title = get_text_or_default(row.find("td", class_="field title").find("a"))
-    date_started = get_text_or_default(
-        row.find("td", class_="field date_started").find(
-            "span", class_="date_started_value"
-        )
-    )
-    date_read = get_text_or_default(
-        row.find("td", class_="field date_read").find("span", class_="date_read_value")
-    )
-    goodreads_id = (
-        row.find("div", class_="js-tooltipTrigger")["data-resource-id"]
-        if row.find("div", class_="js-tooltipTrigger")
-        else ""
-    )
+    tooltip = row.find("div", class_="js-tooltipTrigger")
+    goodreads_id = tooltip.get("data-resource-id", "") if tooltip else ""
 
-    # Convert dates to standard format
-    date_started = convert_date(date_started)
-    date_read = convert_date(date_read)
-
-    # Additional fields
-    author = get_text_or_default(row.find("td", class_="field author").find("a"))
-    avg_rating = get_text_or_default(row.find("td", class_="field avg_rating"))
-    num_pages = (
-        get_text_or_default(
-            row.find("td", class_="field num_pages").find("nobr")
-        ).split()[0]
-        if row.find("td", class_="field num_pages").find("nobr")
-        else ""
-    )
+    num_pages = cell_text(row, "num_pages", tag="nobr")
+    # "320 pp" -> "320"
+    num_pages = num_pages.split()[0] if num_pages else ""
 
     return {
         "Goodreads ID": goodreads_id,
-        "Book Title": book_title,
-        "Date Started": date_started,
-        "Date Read": date_read,
-        "Author": author,
-        "Average Rating": avg_rating,
+        "Book Title": cell_text(row, "title", tag="a"),
+        "Date Started": convert_date(cell_text(row, "date_started", span_class="date_started_value")),
+        "Date Read": convert_date(cell_text(row, "date_read", span_class="date_read_value")),
+        "Author": cell_text(row, "author", tag="a"),
+        "Average Rating": cell_text(row, "avg_rating"),
         "Number of Pages": num_pages,
     }
 
 
-def download_and_process_goodreads_data(user_id, output_file):
+def find_total_pages(soup):
+    """Determine the number of library pages from the pagination widget."""
+    pagination = soup.find("div", id="reviewPagination")
+    if not pagination:
+        return None
+
+    page_numbers = []
+    for link in pagination.find_all("a"):
+        text = link.text.strip()
+        if text.isdigit():
+            page_numbers.append(int(text))
+    return max(page_numbers) if page_numbers else None
+
+
+def download_and_process_goodreads_data(user_id, output_file, cookies_file="cookies.json", delay=1.0):
     """Download Goodreads data and process it directly to TSV."""
-    base_url = f"https://www.goodreads.com/review/list/{user_id}?page={{}}&per_page=100&ref=nav_mybooks&utf8=%E2%9C%93"
+    base_url = (
+        f"https://www.goodreads.com/review/list/{user_id}"
+        "?page={}&per_page=100&ref=nav_mybooks&utf8=%E2%9C%93"
+    )
 
-    # Try to load cookies if they exist
-    cookies = None
-    if os.path.exists("cookies.json"):
-        try:
-            with open("cookies.json", "r") as f:
-                cookies = json.load(f)
-        except json.JSONDecodeError:
-            print(
-                "Warning: cookies.json exists but is not valid JSON. Proceeding without cookies."
-            )
+    session = make_session(load_cookies(cookies_file))
 
-    # Open the TSV file for writing
+    # Fetch the first page before touching the output file, so a failed run
+    # never truncates a previously good export.
+    try:
+        print("Processing page 1...")
+        first_page_html = fetch_html(session, base_url.format(1))
+    except requests.exceptions.HTTPError as e:
+        print(f"Error downloading data: {e}")
+        print("This might be due to:")
+        print("1. Invalid user ID")
+        print("2. Profile is private")
+        print("3. Missing or invalid cookies")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"Network error downloading data: {e}")
+        return False
+
+    soup = BeautifulSoup(first_page_html, "html.parser")
+    total_pages = find_total_pages(soup)
+    if total_pages is None:
+        print("Could not determine total pages. Processing first page only.")
+        total_pages = 1
+
+    rows_written = 0
     with open(output_file, "w", newline="", encoding="utf-8") as tsvfile:
-        fieldnames = [
-            "Goodreads ID",
-            "Book Title",
-            "Date Started",
-            "Date Read",
-            "Author",
-            "Average Rating",
-            "Number of Pages",
-        ]
-        writer = csv.DictWriter(tsvfile, fieldnames=fieldnames, delimiter="\t")
+        writer = csv.DictWriter(tsvfile, fieldnames=FIELDNAMES, delimiter="\t")
         writer.writeheader()
 
-        # Fetch the first page to determine the total number of pages
-        try:
-            first_page_html = fetch_html(base_url.format(1), cookies)
-            soup = BeautifulSoup(first_page_html, "html.parser")
-
-            # Extract the total number of pages
-            pagination = soup.find("div", id="reviewPagination")
-            if pagination:
-                total_pages = int(pagination.find_all("a")[-2].text.strip())
-            else:
-                print("Could not determine total pages. Processing first page only.")
-                total_pages = 1
-
-            # Process each page
-            for page in range(1, total_pages + 1):
+        for page in range(1, total_pages + 1):
+            if page > 1:
                 print(f"Processing page {page} of {total_pages}...")
-                html_content = fetch_html(base_url.format(page), cookies)
+                # Be respectful to the server between page requests.
+                time.sleep(delay)
+                try:
+                    html_content = fetch_html(session, base_url.format(page))
+                except requests.exceptions.RequestException as e:
+                    print(f"Error downloading page {page}: {e}")
+                    print("Stopping early; the TSV contains the pages fetched so far.")
+                    break
                 soup = BeautifulSoup(html_content, "html.parser")
 
-                # Find all review rows
-                review_rows = soup.find_all("tr", class_="bookalike review")
+            for row in soup.find_all("tr", class_="bookalike review"):
+                try:
+                    book = process_review_row(row)
+                except Exception as e:  # one malformed row must not kill the export
+                    print(f"Warning: skipping a malformed row on page {page} ({e}).")
+                    continue
+                if not book["Goodreads ID"] and not book["Book Title"]:
+                    continue  # nothing identifiable in this row
+                writer.writerow(book)
+                rows_written += 1
 
-                # Process each row and write to TSV
-                for row in review_rows:
-                    book_data = process_review_row(row)
-                    writer.writerow(book_data)
+    print(f"Successfully processed {rows_written} books from {total_pages} page(s).")
+    return True
 
-                # Add a small delay to be respectful to the server
-                time.sleep(1)
 
-            print(f"Successfully processed {total_pages} pages of Goodreads data.")
-            return True
+def warn_if_no_read_dates(output_file):
+    """Warn when the exported file has no Date Read values at all."""
+    try:
+        with open(output_file, "r", encoding="utf-8") as tsvfile:
+            reader = csv.DictReader(tsvfile, delimiter="\t")
+            if any((row.get("Date Read") or "").strip() for row in reader):
+                return
+    except OSError as e:
+        print(f"Warning: Could not verify Date Read column: {e}")
+        return
 
-        except requests.exceptions.HTTPError as e:
-            print(f"Error downloading data: {e}")
-            print("This might be due to:")
-            print("1. Invalid user ID")
-            print("2. Profile is private")
-            print("3. Missing or invalid cookies")
-            return False
+    print("\n⚠️  WARNING: The 'Date Read' column appears to be empty for all books.")
+    print("Please ensure the 'Date Read' column is visible in your Goodreads library view.")
+    print("To do this:")
+    print("  1. Go to your Goodreads library")
+    print("  2. Click 'edit' at the top of the columns")
+    print("  3. Make sure 'Date Read' is checked/visible")
+    print("  4. Re-run this script after making the column visible")
 
 
 def main():
     args = docopt(__doc__)
 
-    if download_and_process_goodreads_data(args["<user_id>"], args["--output"]):
-        print(f"Data successfully written to {args['--output']}")
-        
-        # Check if the Date Read column has any data
-        try:
-            with open(args["--output"], "r", encoding="utf-8") as tsvfile:
-                reader = csv.DictReader(tsvfile, delimiter="\t")
-                has_any_date_read = any(row.get("Date Read", "").strip() for row in reader)
-                
-                if not has_any_date_read:
-                    print("\n⚠️  WARNING: The 'Date Read' column appears to be empty for all books.")
-                    print("Please ensure the 'Date Read' column is visible in your Goodreads library view.")
-                    print("To do this:")
-                    print("  1. Go to your Goodreads library")
-                    print("  2. Click 'edit' at the top of the columns")
-                    print("  3. Make sure 'Date Read' is checked/visible")
-                    print("  4. Re-run this script after making the column visible")
-        except Exception as e:
-            print(f"Warning: Could not verify Date Read column: {e}")
-    else:
+    try:
+        delay = float(args["--delay"])
+    except ValueError:
+        print(f"Error: --delay must be a number, got {args['--delay']!r}")
+        return 2
+    if delay < 0:
+        print("Error: --delay must not be negative.")
+        return 2
+
+    output_file = args["--output"]
+    if not download_and_process_goodreads_data(
+        args["<user_id>"], output_file, args["--cookies"], delay
+    ):
         print("Failed to process Goodreads data.")
+        return 1
+
+    print(f"Data successfully written to {output_file}")
+    warn_if_no_read_dates(output_file)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

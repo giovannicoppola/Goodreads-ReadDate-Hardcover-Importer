@@ -1,3 +1,7 @@
-beautifulsoup4==4.12.2
-requests==2.31.0
-docopt==0.6.2
+# Runtime dependencies.
+# Minimum versions rather than exact pins: 2.31.0 of requests carries known
+# CVEs (CVE-2024-35195, CVE-2024-47081), and the older beautifulsoup4 pin
+# does not build on recent Python versions.
+beautifulsoup4>=4.12.3
+requests>=2.32.4
+docopt>=0.6.2

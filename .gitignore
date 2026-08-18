@@ -1,8 +1,12 @@
 .DS_Store
 *.pyc
 __pycache__
+.pytest_cache
 troubleshooting
 venv
+.venv
 hardcover_api_key.json
 log.txt
 cookies.json
+books.tsv
+*.tsv

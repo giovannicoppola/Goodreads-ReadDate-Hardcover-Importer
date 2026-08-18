@@ -15,7 +15,12 @@ This script downloads your Goodreads book data and exports it to a TSV (tab-sepa
 - Downloads your complete Goodreads reading history
 - Exports data in TSV format
 - Includes book titles, authors, dates, ratings, and page counts
-- Optional cookie support for accessing private profiles
+- Optional cookie support for accessing private profiles (only `goodreads.com`
+  cookies from the export are ever sent)
+- Normalises dates to `yyyy-mm-dd`; month-only dates ("Mar 2020") are anchored to
+  the first of the month and placeholders like "not set" become empty
+- Tolerates columns you have hidden in your Goodreads library view instead of
+  aborting the export
 - Automatically checks if the Date Read column is empty and provides helpful guidance
 
 #### Usage
@@ -32,6 +37,18 @@ For example:
 python parse_goodreads.py 38810427-giovanni
 ```
 
+Options:
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--output=<file>` | Output TSV file name | `books.tsv` |
+| `--cookies=<file>` | JSON file with exported Goodreads cookies | `cookies.json` |
+| `--delay=<seconds>` | Pause between page requests | `1` |
+
+The script exits with status `0` on success and `1` if the export failed, so it
+can be used in a shell pipeline. If the very first request fails, the output file
+is left untouched — a failed run will not destroy a previous good export.
+
 ### 2. Hardcover Sync Tool (`sync_hardcover.py`)
 
 This script syncs your Goodreads reading dates with your Hardcover account.
@@ -42,7 +59,10 @@ This script syncs your Goodreads reading dates with your Hardcover account.
 - Finds matching books on Hardcover using Goodreads IDs
 - Updates reading dates on Hardcover to match your Goodreads data
 - Handles multiple reading journeys by matching the finished date
+- Skips books whose dates already match, so re-running is cheap and safe
+- `--dry-run` mode previews every change without writing to Hardcover
 - Option to limit the number of books processed (useful for testing)
+- Retries transient API failures (429/5xx and network errors) with backoff
 - Generates detailed log files for troubleshooting
 
 #### Prerequisites
@@ -59,9 +79,12 @@ This script syncs your Goodreads reading dates with your Hardcover account.
 4. Save it in `hardcover_api_key.json`:
    ```json
    {
-     "api_key": "your_api_key_here"
+     "api_key": "Bearer your_api_key_here"
    }
    ```
+
+The `Bearer ` prefix is added automatically if you leave it out, so both forms
+work.
 
 #### Usage
 
@@ -77,11 +100,27 @@ Test mode (process only a few books):
 python sync_hardcover.py books.tsv --limit=5
 ```
 
+Preview what would change, without writing anything:
+
+```bash
+python sync_hardcover.py books.tsv --dry-run
+```
+
 Generate a log file:
 
 ```bash
 python sync_hardcover.py books.tsv --log
 ```
+
+Options:
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--api-key=<file>` | JSON file holding the Hardcover API key | `hardcover_api_key.json` |
+| `--limit=<n>` | Process at most `n` books (`0` = all) | `0` |
+| `--delay=<seconds>` | Pause between books | `1` |
+| `--dry-run` | Report changes without writing them | off |
+| `--log` | Also write everything to `log.txt` | off |
 
 The script will:
 
@@ -89,7 +128,11 @@ The script will:
 2. Process each book in the TSV file (or up to the specified limit)
 3. Find matching books on Hardcover
 4. If multiple reading journeys exist, it will select the one with a matching finished date
-5. Update the reading dates
+5. Skip the book entirely if the dates on Hardcover already match
+6. Update the reading dates
+
+Exit status is `0` when every book was handled and `1` if any book failed to
+update, so failures are visible to scripts and CI.
 
 #### Logging
 
@@ -123,7 +166,16 @@ If a book has multiple reading dates on Hardcover:
 - If no matching finished date is found, the first journey will be used
 - The script will print a warning when multiple journeys are found
 
-> **Important**: I have not tested the case of multiple read dates on GR.
+Use `--dry-run` first if your library has books with several read journeys, so
+you can see which journey each book would land on before anything is written.
+
+#### Books With Only One Date
+
+Hardcover requires both a start and a finish date on a reading journey. When a
+Goodreads row has only one of the two, the script uses that date for both ends
+rather than skipping the book or sending an empty date to the API. Rows with no
+usable date at all, and rows whose finish date precedes their start date, are
+skipped and reported in the summary.
 
 #### Testing the Script
 
@@ -145,11 +197,24 @@ python sync_hardcover.py books.tsv
 
 ## Installation
 
-1. Make sure you have Python 3.6 or later installed
+1. Make sure you have Python 3.9 or later installed
 2. Install the required packages:
    ```bash
    pip install -r requirements.txt
    ```
+
+## Development
+
+Install the development dependencies and run the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests cover date parsing, Goodreads row extraction, cookie filtering, API
+retry/error handling and the TSV processing loop; they use mocked HTTP and never
+contact Goodreads or Hardcover.
 
 ## Finding Your Goodreads User ID
 
@@ -186,7 +251,9 @@ If your Goodreads profile is private, you can use cookies to access it. Here are
 ### Important Notes
 
 - You must export ALL cookies from Goodreads, not just a single cookie
-- Keep your cookies file secure and never share it
+- The script filters the export down to `goodreads.com` cookies, so cookies for
+  other sites in the file are never sent anywhere
+- Keep your cookies file secure and never share it (it is listed in `.gitignore`)
 - Cookies expire after some time, so you may need to export them again if the script stops working
 - The script will automatically use these cookies if the `cookies.json` file is present
 
@@ -228,6 +295,17 @@ If books aren't being found on Hardcover:
 1. Make sure your API key is correct
 2. Check if the books exist in your Hardcover library
 3. Verify that the Goodreads IDs match between Goodreads and Hardcover
+
+The script distinguishes these cases in its output:
+
+- `No Hardcover book is mapped to Goodreads ID …` — Hardcover has no edition
+  linked to that Goodreads ID
+- `Book found on Hardcover but no reading journey exists for it` — the book is
+  on your shelf but has no read entry to update
+- `Could not fetch user ID` — the API key is missing, expired or malformed
+
+If you see repeated `API Error 429` messages, raise `--delay` to slow the script
+down.
 
 ## License
 
