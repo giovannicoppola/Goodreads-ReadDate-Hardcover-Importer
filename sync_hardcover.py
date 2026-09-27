@@ -71,9 +71,14 @@ class HardcoverClient:
         self.logger.log("\nInitializing HardcoverClient...")
         self.api_key = api_key
         self.api_url = api_url
+        # Accept the key with or without the "Bearer " prefix (Hardcover's settings page
+        # has shown both); the API rejects anything but "Bearer <token>"
+        token = api_key.strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": api_key,  # The API key already includes "Bearer"
+            "Authorization": f"Bearer {token}",
         }
         self.user_id = None  # Cache for user ID
         self.max_retries = 3  # Maximum number of retries for 504 errors
@@ -146,6 +151,9 @@ class HardcoverClient:
             return None
         self.log(f"Error fetching user ID: HTTP {response.status_code}")
         self.log(f"Response: {response.text}")
+        if response.status_code == 401:
+            self.log("Your Hardcover API key is invalid or has expired (keys last one year). "
+                     "Generate a new one in your Hardcover account settings.")
         return None
 
     def find_book_by_goodreads_id(self, goodreads_id, dateFinished):

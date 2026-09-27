@@ -62,6 +62,7 @@ This script syncs your Goodreads reading dates with your Hardcover account.
      "api_key": "your_api_key_here"
    }
    ```
+   The key can be pasted with or without the leading `Bearer `. Hardcover API keys expire after one year; if the script reports that the key is invalid or expired, generate a new one.
 
 #### Usage
 
